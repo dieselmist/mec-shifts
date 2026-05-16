@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="theme-color" content="#0a0e1a" />
+<title>MEC Shifts</title>
+
+<!-- PWA -->
+<link rel="manifest" href="manifest.json" />
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+<link rel="apple-touch-icon" href="apple-touch-icon.png" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="MEC Shifts" />
+<meta name="mobile-web-app-capable" content="yes" />
+
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  * { font-family: 'Lexend', sans-serif; -webkit-tap-highlight-color: transparent; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  html, body { background: #0a0e1a; overscroll-behavior: none; }
+  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  input[type="date"], input[type="time"], input[type="number"] { color-scheme: dark; }
+  input, select, textarea { font-family: 'Lexend', sans-serif; font-size: 16px; }
+  @keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.4); }
+    50% { box-shadow: 0 0 0 20px rgba(251, 191, 36, 0); }
+  }
+  .pulse-amber { animation: pulse-glow 2s infinite; }
+  @keyframes pulse-red {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .blink { animation: pulse-red 1.5s infinite; }
+</style>
+</head>
+<body class="text-stone-100">
+
+<div id="app"></div>
+
+<script>
+// ----------------------- STATE -----------------------
+const state = {
+  shifts: [],
+  settings: { hourlyRate: 0 },
+  activeShift: null,
+  view: 'week',
+  modal: null,        // 'manual' | 'stop' | 'settings' | null
+  editingId: null,
+  form: defaultForm(),
+  stopForm: defaultForm(),
+  tick: 0,
+};
+
+function defaultForm() {
+  const today = new Date().toISOString().slice(0, 10);
+  return { date: today, startTime: '07:00', endTime: '17:00', breakMins: 30, type: 'Driving', notes: '' };
+}
+
+// ----------------------- STORAGE -----------------------
+function load() {
+  try {
+    const s = localStorage.getItem('mec-shifts');
+    if (s) state.shifts = JSON.parse(s);
+  } catch (e) {}
+  try {
+    const c = localStorage.getItem('mec-settings');
+    if (c) state.settings = JSON.parse(c);
+  } catch (e) {}
+  try {
+    const a = localStorage.getItem('mec-active');
+    if (a) state.activeShift = JSON.parse(a);
+  } catch (e) {}
+}
+function saveShifts() { localStorage.setItem('mec-shifts', JSON.stringify(state.shifts)); }
+function saveSettings() { localStorage.setItem('mec-settings', JSON.stringify(state.settings)); }
+function saveActive() {
+  if (state.activeShift) localStorage.setItem('mec-active', JSON.stringify(state.activeShift));
+  else localStorage.removeItem('mec-active');
+}
+
+// ----------------------- HELPERS -----------------------
+const today = () => new Date().toISOString().slice(0, 10);
+const pad = n => n.toString().padStart(2, '0');
+const fmtHours = (h) => {
+  const totalMin = Math.round(h * 60);
+  return `${Math.floor(totalMin / 60)}h ${pad(totalMin % 60)}m`;
+};
+const fmtElapsed = (ms) => {
+  const t = Math.max(0, Math.floor(ms / 1000));
+  return `${pad(Math.floor(t/3600))}:${pad(Math.floor((t%3600)/60))}:${pad(t%60)}`;
+};
+const fmtDate = (d) => new Date(d).toLocaleDateString('en-GB', {
+  weekday: 'short', day: 'numeric', month: 'short'
+});
+const isoToTime = (iso) => { const d = new Date(iso); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+
+function calcHours(s) {
+  const [sh, sm] = s.startTime.split(':').map(Number);
+  const [eh, em] = s.endTime.split(':').map(Number);
+  let mins = (eh*60+em) - (sh*60+sm);
+  if (mins < 0) mins += 24*60;
+  mins -= Number(s.breakMins || 0);
+  return Math.max(0, mins/60);
+}
+
+function breakMsFor(a, atTime) {
+  if (!a) return 0;
+  return a.breaks.reduce((sum, b) => {
+    const end = b.endISO ? new Date(b.endISO).getTime() : atTime;
+    return sum + Math.max(0, end - new Date(b.startISO).getTime());
+  }, 0);
+}
+const isOnBreak = (a) => a && a.breaks.length > 0 && !a.breaks[a.breaks.length-1].endISO;
+
+function getWeekStart(dateStr) {
+  const d = new Date(dateStr);
+  const day = d.getDay();
+  d.setDate(d.getDate() + (day === 0 ? -6 : 1 - day));
+  return d.toISOString().slice(0, 10);
+}
+
+function escape(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[c]));
+}
+
+// ----------------------- ACTIONS -----------------------
+function startTimer(type) {
+  state.activeShift = { date: today(), startISO: new Date().toISOString(), type, breaks: [] };
+  saveActive();
+  render();
+}
+
+function toggleBreak() {
+  if (!state.activeShift) return;
+  const nowISO = new Date().toISOString();
+  const breaks = state.activeShift.breaks.slice();
+  if (isOnBreak(state.activeShift)) {
+    breaks[breaks.length-1] = { ...breaks[breaks.length-1], endISO: nowISO };
+  } else {
+    breaks.push({ startISO: nowISO, endISO: null });
+  }
+  state.activeShift = { ...state.activeShift, breaks };
+  saveActive();
+  render();
+}
+
+function stopTimer() {
+  if (!state.activeShift) return;
+  const nowISO = new Date().toISOString();
+  let breaks = state.activeShift.breaks;
+  if (isOnBreak(state.activeShift)) {
+    breaks = breaks.slice();
+    breaks[breaks.length-1] = { ...breaks[breaks.length-1], endISO: nowISO };
+  }
+  const breakMins = Math.round(breakMsFor({ ...state.activeShift, breaks }, Date.now()) / 60000);
+  state.stopForm = {
+    date: state.activeShift.date,
+    startTime: isoToTime(state.activeShift.startISO),
+    endTime: isoToTime(nowISO),
+    breakMins,
+    type: state.activeShift.type,
+    notes: '',
+  };
+  state.modal = 'stop';
+  render();
+}
+
+function confirmStop() {
+  state.shifts.push({ ...state.stopForm, id: Date.now().toString() });
+  saveShifts();
+  state.activeShift = null;
+  saveActive();
+  state.modal = null;
+  render();
+}
+
+function discardTimer() {
+  if (!confirm('Discard this shift without saving?')) return;
+  state.activeShift = null;
+  saveActive();
+  state.modal = null;
+  render();
+}
+
+function openManual(shift) {
+  if (shift) {
+    state.form = { ...shift };
+    state.editingId = shift.id;
+  } else {
+    state.form = defaultForm();
+    state.editingId = null;
+  }
+  state.modal = 'manual';
+  render();
+}
+
+function saveManual() {
+  if (!state.form.date || !state.form.startTime || !state.form.endTime) return;
+  if (state.editingId) {
+    state.shifts = state.shifts.map(s => s.id === state.editingId ? { ...state.form, id: state.editingId } : s);
+  } else {
+    state.shifts.push({ ...state.form, id: Date.now().toString() });
+  }
+  saveShifts();
+  state.modal = null;
+  state.editingId = null;
+  render();
+}
+
+function deleteShift(id) {
+  if (!confirm('Delete this shift?')) return;
+  state.shifts = state.shifts.filter(s => s.id !== id);
+  saveShifts();
+  render();
+}
+
+function exportCSV() {
+  const headers = ['Date','Start','End','Break (mins)','Hours','Type','Notes'];
+  const rows = state.shifts.slice().sort((a,b) => a.date.localeCompare(b.date))
+    .map(s => [s.date, s.startTime, s.endTime, s.breakMins, calcHours(s).toFixed(2), s.type, (s.notes||'').replace(/[\n,]/g,' ')]);
+  const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `mec-shifts-${today()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function setView(v) { state.view = v; render(); }
+function setForm(field, val) { state.form = { ...state.form, [field]: val }; render(); }
+function setStopForm(field, val) { state.stopForm = { ...state.stopForm, [field]: val }; render(); }
+function setSetting(field, val) {
+  state.settings = { ...state.settings, [field]: val };
+  saveSettings();
+  render();
+}
+function openModal(m) { state.modal = m; render(); }
+function closeModal() { state.modal = null; state.editingId = null; render(); }
+
+// ----------------------- RENDER -----------------------
+const inputCls = "w-full bg-stone-900 border border-stone-800 rounded-xl px-3 py-3 text-stone-100 focus:outline-none focus:border-amber-400/50";
+
+function field(label, icon, inner) {
+  return `<label class="block">
+    <span class="flex items-center gap-1.5 text-xs uppercase tracking-wider text-stone-500 mono mb-1.5">
+      ${icon || ''}${escape(label)}
+    </span>
+    ${inner}
+  </label>`;
+}
+
+const icons = {
+  settings: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
+  play: `<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20 6 4"/></svg>`,
+  pause: `<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`,
+  stop: `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14"/></svg>`,
+  x: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+  edit: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`,
+  trash: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>`,
+  download: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
+  clock: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
+  cal: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
+  file: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`,
+  pen: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>`,
+};
+
+function render() {
+  const root = document.getElementById('app');
+  const now = Date.now();
+
+  // -------- Stats --------
+  const ws = getWeekStart(today());
+  const tm = today().slice(0, 7);
+  const sorted = state.shifts.slice().sort((a,b) =>
+    b.date.localeCompare(a.date) || b.startTime.localeCompare(a.startTime)
+  );
+  let filtered = sorted;
+  if (state.view === 'week') filtered = sorted.filter(s => s.date >= ws);
+  else if (state.view === 'month') filtered = sorted.filter(s => s.date.startsWith(tm));
+  const totalH = filtered.reduce((sum, s) => sum + calcHours(s), 0);
+  const earnings = totalH * (Number(state.settings.hourlyRate) || 0);
+
+  // -------- Timer panel --------
+  let timerPanel;
+  if (!state.activeShift) {
+    timerPanel = `
+      <div class="rounded-3xl border border-amber-400/20 bg-gradient-to-br from-stone-900 to-stone-950 p-6 relative overflow-hidden">
+        <div class="absolute -top-10 -right-10 w-40 h-40 bg-amber-400/10 rounded-full blur-3xl"></div>
+        <div class="text-xs text-stone-500 mono tracking-wider uppercase mb-1">Clock in</div>
+        <div class="text-stone-300 mb-5">Ready to start a shift?</div>
+        <button onclick="startTimer('Driving')"
+          class="w-full py-5 bg-amber-400 text-stone-950 font-bold text-lg rounded-2xl active:bg-amber-500 flex items-center justify-center gap-3 pulse-amber">
+          ${icons.play} Start shift
+        </button>
+        <div class="flex flex-wrap gap-x-3 gap-y-1 mt-3 text-xs items-center">
+          <span class="text-stone-500 mono">Or start as:</span>
+          <button onclick="startTimer('Dispatching')" class="text-amber-400/80 underline mono">Dispatching</button>
+          <button onclick="startTimer('School run')" class="text-amber-400/80 underline mono">School run</button>
+        </div>
+      </div>`;
+  } else {
+    const a = state.activeShift;
+    const onBreak = isOnBreak(a);
+    const elapsed = (now - new Date(a.startISO).getTime()) - breakMsFor(a, now);
+    const bMin = Math.round(breakMsFor(a, now) / 60000);
+    timerPanel = `
+      <div class="rounded-3xl border p-6 relative overflow-hidden ${
+        onBreak ? 'border-stone-700 bg-stone-950' : 'border-amber-400/40 bg-gradient-to-br from-amber-950/40 to-stone-950'
+      }">
+        <div class="absolute -top-10 -right-10 w-48 h-48 rounded-full blur-3xl ${onBreak ? 'bg-stone-700/20' : 'bg-amber-400/20'}"></div>
+        <div class="flex items-center justify-between relative mb-2">
+          <div class="flex items-center gap-2">
+            <span class="w-2.5 h-2.5 rounded-full ${onBreak ? 'bg-stone-500' : 'bg-amber-400 blink'}"></span>
+            <span class="text-xs mono uppercase tracking-wider text-stone-400">
+              ${onBreak ? 'On break' : 'Running'} · ${escape(a.type)}
+            </span>
+          </div>
+          <span class="text-xs mono text-stone-500">Since ${isoToTime(a.startISO)}</span>
+        </div>
+        <div class="mono text-5xl sm:text-6xl font-bold tabular-nums relative text-amber-400 my-2">${fmtElapsed(elapsed)}</div>
+        ${bMin > 0 ? `<div class="text-xs text-stone-500 mono mb-4">Break total: ${bMin}m</div>` : ''}
+        <div class="grid grid-cols-2 gap-3 mt-5 relative">
+          <button onclick="toggleBreak()" class="py-4 bg-stone-800 text-stone-100 font-semibold rounded-2xl active:bg-stone-700 flex items-center justify-center gap-2">
+            ${onBreak ? icons.play + ' Resume' : icons.pause + ' Break'}
+          </button>
+          <button onclick="stopTimer()" class="py-4 bg-red-500/90 text-white font-semibold rounded-2xl active:bg-red-600 flex items-center justify-center gap-2">
+            ${icons.stop} Stop
+          </button>
+        </div>
+      </div>`;
+  }
+
+  // -------- Shifts list --------
+  const list = filtered.length === 0
+    ? `<div class="text-center py-12 rounded-2xl border border-dashed border-stone-800">
+         ${icons.clock.replace('width="16"','width="32"').replace('height="16"','height="32"')}
+         <div class="text-stone-500 text-sm mt-3">Nothing logged yet in this view.</div>
+       </div>`
+    : `<ul class="space-y-2.5">${filtered.map(s => `
+        <li class="rounded-2xl bg-stone-900/70 border border-stone-800 p-4">
+          <div class="flex items-start justify-between gap-3">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 mb-1 flex-wrap">
+                <span class="text-sm font-medium text-stone-300">${escape(fmtDate(s.date))}</span>
+                <span class="text-[10px] px-2 py-0.5 rounded-full bg-stone-800 text-amber-400/90 uppercase tracking-wider mono">${escape(s.type)}</span>
+              </div>
+              <div class="mono text-lg tabular-nums text-stone-100">${escape(s.startTime)} <span class="text-stone-600">→</span> ${escape(s.endTime)}</div>
+              <div class="text-xs text-stone-500 mt-1 mono">
+                ${fmtHours(calcHours(s))}${Number(s.breakMins) > 0 ? ` · ${escape(s.breakMins)}m break` : ''}
+              </div>
+              ${s.notes ? `<div class="text-xs text-stone-400 mt-2 italic">${escape(s.notes)}</div>` : ''}
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <button onclick='openManual(${JSON.stringify(s).replace(/'/g, "&#39;")})' class="p-2 rounded-lg bg-stone-800 active:bg-stone-700 text-stone-400">${icons.edit}</button>
+              <button onclick="deleteShift('${escape(s.id)}')" class="p-2 rounded-lg bg-stone-800 active:bg-stone-700 text-red-400/80">${icons.trash}</button>
+            </div>
+          </div>
+        </li>`).join('')}</ul>`;
+
+  // -------- Modals --------
+  let modalHTML = '';
+  if (state.modal === 'stop') {
+    const f = state.stopForm;
+    modalHTML = modal('Save shift', `
+      <div class="bg-amber-400/10 border border-amber-400/20 rounded-2xl px-4 py-3 mb-4 flex justify-between items-center">
+        <span class="text-xs text-amber-400/80 uppercase tracking-wider mono">Worked</span>
+        <span class="mono text-2xl font-bold text-amber-400 tabular-nums">${fmtHours(calcHours(f))}</span>
+      </div>
+      <div class="space-y-4">
+        ${field('Date', icons.cal, `<input type="date" value="${escape(f.date)}" oninput="setStopForm('date', this.value)" class="${inputCls}" />`)}
+        <div class="grid grid-cols-2 gap-3">
+          ${field('Start', icons.clock, `<input type="time" value="${escape(f.startTime)}" oninput="setStopForm('startTime', this.value)" class="${inputCls} mono" />`)}
+          ${field('End', icons.clock, `<input type="time" value="${escape(f.endTime)}" oninput="setStopForm('endTime', this.value)" class="${inputCls} mono" />`)}
+        </div>
+        ${field('Break (minutes)', '', `<input type="number" min="0" value="${escape(f.breakMins)}" oninput="setStopForm('breakMins', this.value)" class="${inputCls} mono" />`)}
+        ${field('Type', '', `<select onchange="setStopForm('type', this.value)" class="${inputCls}">
+          ${['Driving','Dispatching','School run','Mixed','Other'].map(o => `<option ${f.type===o?'selected':''}>${o}</option>`).join('')}
+        </select>`)}
+        ${field('Notes (optional)', icons.file, `<textarea rows="2" oninput="setStopForm('notes', this.value)" placeholder="e.g. Knaresborough school run" class="${inputCls} resize-none">${escape(f.notes)}</textarea>`)}
+        <button onclick="confirmStop()" class="w-full py-3.5 bg-amber-400 text-stone-950 font-semibold rounded-xl active:bg-amber-500">Save shift</button>
+        <button onclick="discardTimer()" class="w-full py-3 text-red-400/80 text-sm active:text-red-400">Discard without saving</button>
+      </div>`, false);
+  } else if (state.modal === 'manual') {
+    const f = state.form;
+    modalHTML = modal(state.editingId ? 'Edit shift' : 'Add past shift', `
+      <div class="space-y-4">
+        ${field('Date', icons.cal, `<input type="date" value="${escape(f.date)}" oninput="setForm('date', this.value)" class="${inputCls}" />`)}
+        <div class="grid grid-cols-2 gap-3">
+          ${field('Start', icons.clock, `<input type="time" value="${escape(f.startTime)}" oninput="setForm('startTime', this.value)" class="${inputCls} mono" />`)}
+          ${field('End', icons.clock, `<input type="time" value="${escape(f.endTime)}" oninput="setForm('endTime', this.value)" class="${inputCls} mono" />`)}
+        </div>
+        ${field('Break (minutes)', '', `<input type="number" min="0" value="${escape(f.breakMins)}" oninput="setForm('breakMins', this.value)" class="${inputCls} mono" />`)}
+        ${field('Type', '', `<select onchange="setForm('type', this.value)" class="${inputCls}">
+          ${['Driving','Dispatching','School run','Mixed','Other'].map(o => `<option ${f.type===o?'selected':''}>${o}</option>`).join('')}
+        </select>`)}
+        ${field('Notes (optional)', icons.file, `<textarea rows="2" oninput="setForm('notes', this.value)" class="${inputCls} resize-none">${escape(f.notes)}</textarea>`)}
+        <div class="bg-stone-900/60 border border-stone-800 rounded-xl px-4 py-3 flex justify-between items-center">
+          <span class="text-xs text-stone-500 uppercase tracking-wider mono">Total</span>
+          <span class="mono text-xl font-semibold text-amber-400 tabular-nums">${fmtHours(calcHours(f))}</span>
+        </div>
+        <button onclick="saveManual()" class="w-full py-3.5 bg-amber-400 text-stone-950 font-semibold rounded-xl active:bg-amber-500">${state.editingId ? 'Save changes' : 'Add shift'}</button>
+      </div>`, true);
+  } else if (state.modal === 'settings') {
+    modalHTML = modal('Settings', `
+      ${field('Hourly rate (£) — optional', '', `<input type="number" step="0.01" min="0" value="${escape(state.settings.hourlyRate)}" oninput="setSetting('hourlyRate', this.value)" placeholder="e.g. 14.10" class="${inputCls} mono" />`)}
+      <div class="text-xs text-stone-500 mt-4 leading-relaxed">
+        Shifts and the running timer save automatically to this device. The timer keeps counting even when the app is closed.
+      </div>`, true);
+  }
+
+  // -------- Assemble --------
+  root.innerHTML = `
+    <div class="min-h-screen pb-32">
+      <header class="px-5 pt-8 pb-5 border-b border-stone-800">
+        <div class="flex items-center justify-between">
+          <div>
+            <div class="text-xs tracking-[0.3em] text-amber-400/70 mono uppercase">MEC · Shift Log</div>
+            <h1 class="text-3xl font-semibold tracking-tight mt-1">Hours</h1>
+          </div>
+          <button onclick="openModal('settings')" class="p-2 rounded-full bg-stone-900 border border-stone-800 active:bg-stone-800 text-stone-400">${icons.settings}</button>
+        </div>
+      </header>
+
+      <section class="px-5 pt-5">${timerPanel}</section>
+
+      <section class="px-5 pt-5">
+        <div class="rounded-2xl border border-stone-800 bg-stone-900/50 p-5">
+          <div class="flex gap-2 mb-3">
+            ${['week','month','all'].map(v => `
+              <button onclick="setView('${v}')" class="text-xs px-3 py-1 rounded-full uppercase tracking-wider mono ${
+                state.view===v ? 'bg-amber-400 text-stone-950 font-semibold' : 'bg-stone-800/60 text-stone-400'
+              }">${v === 'week' ? 'This Week' : v === 'month' ? 'This Month' : 'All'}</button>
+            `).join('')}
+          </div>
+          <div class="flex items-end justify-between">
+            <div>
+              <div class="text-xs text-stone-500 mono tracking-wider uppercase">Logged</div>
+              <div class="mono text-4xl font-bold text-stone-100 mt-1 tabular-nums">${fmtHours(totalH)}</div>
+              ${Number(state.settings.hourlyRate) > 0 ? `<div class="mono text-base text-amber-400 mt-1 tabular-nums">£${earnings.toFixed(2)}</div>` : ''}
+            </div>
+            <div class="text-sm text-stone-500 mono">${filtered.length} shift${filtered.length===1?'':'s'}</div>
+          </div>
+        </div>
+      </section>
+
+      <main class="px-5 pt-5">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm uppercase tracking-wider text-stone-500 mono">History</h2>
+          <button onclick="openManual(null)" class="text-xs text-amber-400/80 mono flex items-center gap-1.5 active:text-amber-400">
+            ${icons.pen} Add past shift
+          </button>
+        </div>
+        ${list}
+        ${state.shifts.length > 0 ? `<button onclick="exportCSV()" class="mt-6 w-full flex items-center justify-center gap-2 py-3 rounded-2xl border border-stone-800 text-stone-400 active:bg-stone-900">${icons.download} Export all to CSV</button>` : ''}
+      </main>
+    </div>
+    ${modalHTML}
+  `;
+}
+
+function modal(title, body, dismissOnBackdrop) {
+  return `<div class="fixed inset-0 bg-black/70 z-50 flex items-end sm:items-center justify-center" ${dismissOnBackdrop ? 'onclick="if(event.target===this) closeModal()"' : ''}>
+    <div class="bg-stone-950 border-t sm:border border-stone-800 rounded-t-3xl sm:rounded-3xl w-full sm:max-w-md sm:mx-4 p-5 max-h-[92vh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-5">
+        <h2 class="text-xl font-semibold">${escape(title)}</h2>
+        <button onclick="closeModal()" class="p-1.5 rounded-full bg-stone-900 text-stone-400">${icons.x}</button>
+      </div>
+      ${body}
+    </div>
+  </div>`;
+}
+
+// ----------------------- BOOT -----------------------
+load();
+render();
+setInterval(() => { if (state.activeShift) render(); }, 1000);
+
+// Register service worker for offline support
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
